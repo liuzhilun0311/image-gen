@@ -1,0 +1,21 @@
+# Local secrets and runtime configuration
+scripts/.env
+.env
+.env.*
+!.env.example
+
+# Generated image outputs
+image2_output/
+scripts/image2_output/
+gpt-image2_*.json
+gpt-image2_*.png
+gpt-image2_*.jpg
+gpt-image2_*.webp
+
+# macOS metadata
+.DS_Store
+**/.DS_Store
+
+# Dependency and runtime noise
+node_modules/
+*.log
