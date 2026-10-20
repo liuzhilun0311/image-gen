@@ -20,12 +20,135 @@ const sendJSON = (res, body, status = 200, headers = {}) => {
   res.end(JSON.stringify(body));
 };
 
+const taskDefaults = {
+  GPT_IMAGE2_MODEL: "gpt-image-2.5-sunburst", GPT_IMAGE2_N: 1,
+  GPT_IMAGE2_MODE: "current", GPT_IMAGE2_RESOLUTION: "1k",
+  GPT_IMAGE2_ASPECT_RATIO: "4:3", GPT_IMAGE2_QUALITY: "medium",
+  GPT_IMAGE2_BACKGROUND: "", GPT_IMAGE2_OUTPUT_FORMAT: "",
+  GPT_IMAGE2_OUTPUT_COMPRESSION: "", GPT_IMAGE2_MODERATION: "",
+  GPT_IMAGE2_SHOW_INFO: false,
+};
+
+test("task snapshot overrides environment and clears optional fields", async (t) => {
+  const h = await harness(t, (_req, res) => sendJSON(res, imageResponse()));
+  const config = path.join(h.dir, "execution.json");
+  await fs.writeFile(config, JSON.stringify({ schema_version: 1, request_defaults: taskDefaults }));
+  const r = await h.run([...prompt, "--execution-config", config], {
+    GPT_IMAGE2_MODEL: "invalid-default", GPT_IMAGE2_QUALITY: "max",
+    GPT_IMAGE2_BACKGROUND: "transparent", GPT_IMAGE2_OUTPUT_FORMAT: "webp",
+    GPT_IMAGE2_OUTPUT_COMPRESSION: "99", GPT_IMAGE2_MODERATION: "low",
+    GPT_IMAGE2_SHOW_INFO: "true",
+  });
+  assert.equal(r.code, 0, r.stderr);
+  const body = JSON.parse(h.requests[0].body.toString());
+  assert.equal(body.model, taskDefaults.GPT_IMAGE2_MODEL);
+  assert.equal(body.quality, "medium");
+  assert.equal(body.n, 1);
+  for (const key of ["background", "output_format", "output_compression", "moderation"]) {
+    assert.equal(Object.hasOwn(body, key), false);
+  }
+  assert.equal(r.result.info_summary, undefined);
+});
+
+test("invalid snapshots and contradictory overrides never send a request", async (t) => {
+  const h = await harness(t, (_req, res) => sendJSON(res, imageResponse()));
+  const config = path.join(h.dir, "execution.json");
+  for (const defaults of [
+    { ...taskDefaults, GPT_IMAGE2_API_KEY: "forbidden" },
+    { ...taskDefaults, GPT_IMAGE2_BASE_URL: "https://attacker.invalid" },
+    { GPT_IMAGE2_MODEL: "gpt-image-2.5-flare" },
+  ]) {
+    await fs.writeFile(config, JSON.stringify({ schema_version: 1, request_defaults: defaults }));
+    assert.notEqual((await h.run([...prompt, "--execution-config", config])).code, 0);
+  }
+  await fs.writeFile(config, JSON.stringify({ schema_version: 1, request_defaults: taskDefaults }));
+  assert.notEqual((await h.run([...prompt, "--execution-config", config, "--quality", "max"])).code, 0);
+  assert.equal(h.requests.length, 0);
+});
+
+test("execution snapshots reject secrets in caller metadata but accept documented task metadata", async (t) => {
+  const h = await harness(t, (_req, res) => sendJSON(res, imageResponse()));
+  const config = path.join(h.dir, "execution.json");
+  for (const extra of [
+    { schema_version: 1, request_defaults: taskDefaults, storage: { api_key: "forbidden" } },
+    { schema_version: 1, request_defaults: taskDefaults, service: { base_url: "https://attacker.invalid" } },
+  ]) {
+    await fs.writeFile(config, JSON.stringify(extra));
+    assert.notEqual((await h.run([...prompt, "--execution-config", config])).code, 0);
+  }
+  await fs.writeFile(config, JSON.stringify({
+    schema_version: 1, request_defaults: taskDefaults,
+    prompt_settings: { style: "minimal" }, prompt_supplements: {},
+    references: [], scheduling: { batch_size: 1 },
+    storage: { output_dir: "imgs" }, limits: "caller-enforced",
+  }));
+  const r = await h.run([...prompt, "--execution-config", config]);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(h.requests.length, 1);
+});
+
+test("caller-provided service environment remains authoritative over task drawing snapshot", async (t) => {
+  const h = await harness(t, (_req, res) => sendJSON(res, imageResponse()));
+  const config = path.join(h.dir, "execution.json");
+  await fs.writeFile(config, JSON.stringify({ schema_version: 1, request_defaults: taskDefaults }));
+  const r = await h.run([...prompt, "--execution-config", config], {
+    GPT_IMAGE2_API_KEY: "external-caller-key",
+    GPT_IMAGE2_BASE_URL: h.baseUrl,
+  });
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(h.requests.length, 1);
+  assert.equal(h.requests[0].headers.authorization, "Bearer external-caller-key");
+});
+
+test("configuration inspection reads only this skill and never sends requests", async (t) => {
+  const h = await harness(t, (_req, res) => sendJSON(res, imageResponse()));
+  await fs.writeFile(path.join(h.dir, ".env"),
+    `GPT_IMAGE2_API_KEY=local-config-key\nGPT_IMAGE2_MODEL=sunburst\n`);
+  const r = await h.run(["--check-config"], { GPT_IMAGE2_API_KEY: undefined });
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(JSON.parse(r.stdout).model, "gpt-image-2.5-sunburst");
+  assert.doesNotMatch(r.stdout, /local-config-key|local-test-key|127\.0\.0\.1/);
+  const missing = await h.run(["--check-config"], { GPT_IMAGE2_API_KEY: "" });
+  assert.equal(missing.code, 0, missing.stderr);
+  assert.equal(JSON.parse(missing.stdout).configured, false);
+  assert.equal(h.requests.length, 0);
+});
+
+test("provided channel is required and metadata sensitive fields are redacted", async (t) => {
+  const h = await harness(t, (_req, res) => sendJSON(res, {
+    data: [{ b64_json: fixtures.png, revised_prompt: "local-test-key" }],
+    usage: { input_tokens: 1, authorization: "another-secret-value" },
+  }));
+  const config = path.join(h.dir, "execution.json");
+  await fs.writeFile(config, JSON.stringify({ schema_version: 1, request_defaults: taskDefaults }));
+  for (const base of ["http://code.heihuzi.ai", "https://other.invalid"]) {
+    assert.notEqual((await h.run([...prompt, "--execution-config", config],
+      { GPT_IMAGE2_BASE_URL: base })).code, 0);
+  }
+  assert.equal(h.requests.length, 0);
+  const r = await h.run(prompt);
+  assert.equal(r.code, 0, r.stderr);
+  const metadata = await fs.readFile(r.result.metadata_path, "utf8");
+  assert.doesNotMatch(r.stdout + r.stderr + metadata, /local-test-key|another-secret-value/);
+});
+
+test("standalone configuration rejects a non-platform base URL", async (t) => {
+  const h = await harness(t, (_req, res) => sendJSON(res, imageResponse()));
+  const r = await h.run([...prompt, "--dry-run", "--base-url", "https://standalone.invalid"]);
+  assert.notEqual(r.code, 0);
+  assert.match(r.stderr, /固定服务平台地址/);
+  assert.equal(h.requests.length, 0);
+});
+
 async function harness(t, handler) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gpt-image2-test-"));
+  const runtimeDir = path.join(dir, "scripts");
+  await fs.mkdir(runtimeDir);
   const outDir = path.join(dir, "images with spaces");
   // Copy executable code only: tests never read a user's .env or use real keys.
-  for (const name of ["gpt-image2.mjs", "request-controls.mjs", "cost-summary.mjs", "image-info.mjs"]) {
-    await fs.copyFile(path.join(scriptsDir, name), path.join(dir, name));
+  for (const name of ["gpt-image2.mjs", "request-controls.mjs", "info-summary.mjs", "image-info.mjs",
+    "model-capabilities.mjs", "gpt-image.mjs", "banana-image.mjs"]) {
+    await fs.copyFile(path.join(scriptsDir, name), path.join(runtimeDir, name));
   }
   const requests = [];
   const server = http.createServer(async (req, res) => {
@@ -47,8 +170,12 @@ async function harness(t, handler) {
     await fs.rm(dir, { recursive: true, force: true });
   });
   const run = (args = [], envOverrides = {}) => new Promise((resolve, reject) => {
-    const cleanEnv = Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith("GPT_IMAGE2_")));
-    const child = spawn(process.execPath, [path.join(dir, "gpt-image2.mjs"), ...args], {
+    const cleanEnv = Object.fromEntries(Object.entries(process.env).filter(([name]) =>
+      !name.startsWith("GPT_IMAGE2_") &&
+      !name.startsWith("IMAGE_GEN_") &&
+      !name.startsWith("FLARE_SUNBURST_") &&
+      !name.startsWith("BANANA_")));
+    const child = spawn(process.execPath, [path.join(runtimeDir, "gpt-image2.mjs"), ...args], {
       cwd: dir,
       env: {
         ...cleanEnv, TMPDIR: dir, GPT_IMAGE2_API_KEY: "local-test-key",
@@ -65,8 +192,149 @@ async function harness(t, handler) {
       resolve({ code, stdout, stderr, result: line ? JSON.parse(line.slice(9)) : null });
     });
   });
-  return { dir, outDir, baseUrl, requests, run };
+  return { dir: runtimeDir, root: dir, outDir, baseUrl, requests, run };
 }
+
+async function preferenceFixture(h, defaults) {
+  const config = path.join(h.root, "config");
+  await fs.mkdir(config, { recursive: true });
+  await fs.writeFile(path.join(config, "extend.md"),
+    "# Preferences\n\n```json\n" + JSON.stringify({ version: 1, defaults }) + "\n```\n");
+  return config;
+}
+
+test("canonical runtime config and preferences work without content-gen or Python", async (t) => {
+  const h = await harness(t, (_req, res) => sendJSON(res, imageResponse()));
+  const config = await preferenceFixture(h, {
+    model: "sunburst", n: 1, resolution: "2k", aspect_ratio: "16:9", quality: "high",
+    output_format: "png", show_info: false,
+  });
+  await fs.writeFile(path.join(config, ".env"),
+    `GPT_IMAGE2_API_KEY=canonical-local-key\nGPT_IMAGE2_BASE_URL=${h.baseUrl}\n`);
+  await fs.writeFile(path.join(h.dir, ".env"), "GPT_IMAGE2_API_KEY=legacy-local-key\n");
+  const r = await h.run(prompt, { GPT_IMAGE2_API_KEY: undefined, GPT_IMAGE2_BASE_URL: undefined });
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(h.requests[0].headers.authorization, "Bearer canonical-local-key");
+  const body = JSON.parse(h.requests[0].body);
+  assert.equal(body.model, "gpt-image-2.5-sunburst");
+  assert.equal(body.size, "2048x1152");
+  assert.equal(body.quality, "high");
+  assert.equal(body.output_format, "png");
+  assert.doesNotMatch(r.stdout + r.stderr, /canonical-local-key|legacy-local-key/);
+});
+
+test("new IMAGE_GEN runtime names and provider key work", async (t) => {
+  const h = await harness(t, (_req, res) => sendJSON(res, imageResponse()));
+  const r = await h.run(prompt, {
+    GPT_IMAGE2_API_KEY: undefined,
+    GPT_IMAGE2_BASE_URL: undefined,
+    IMAGE_GEN_BASE_URL: h.baseUrl,
+    IMAGE_GEN_MODE: "current",
+    IMAGE_GEN_TIMEOUT_MS: "10000",
+    IMAGE_GEN_MAX_RETRIES: "0",
+    IMAGE_GEN_MIN_INTERVAL_MS: "0",
+    IMAGE_GEN_CONCURRENCY: "1",
+    FLARE_SUNBURST_API_KEY: "new-provider-key",
+  });
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(h.requests[0].headers.authorization, "Bearer new-provider-key");
+});
+
+test("missing config files are initialized from their examples", async (t) => {
+  const h = await harness(t, (_req, res) => sendJSON(res, imageResponse()));
+  const config = path.join(h.root, "config");
+  await fs.mkdir(config, { recursive: true });
+  await fs.writeFile(path.join(config, ".env.example"),
+    `FLARE_SUNBURST_API_KEY=\nIMAGE_GEN_BASE_URL=${h.baseUrl}\n`);
+  await fs.writeFile(path.join(config, "extend.example.md"),
+    "# Defaults\n\n```json\n{\"version\":1,\"defaults\":{\"model\":\"gpt-image-2.5-flare\",\"n\":1}}\n```\n");
+  const r = await h.run(["--check-config"], {
+    GPT_IMAGE2_API_KEY: "",
+    GPT_IMAGE2_BASE_URL: undefined,
+    IMAGE_GEN_BASE_URL: undefined,
+  });
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(JSON.parse(r.stdout).model, "gpt-image-2.5-flare");
+  assert.equal(await fs.readFile(path.join(config, ".env"), "utf8"),
+    `FLARE_SUNBURST_API_KEY=\nIMAGE_GEN_BASE_URL=${h.baseUrl}\n`);
+  assert.equal(await fs.readFile(path.join(config, "extend.md"), "utf8"),
+    "# Defaults\n\n```json\n{\"version\":1,\"defaults\":{\"model\":\"gpt-image-2.5-flare\",\"n\":1}}\n```\n");
+});
+
+const bananaResponse = (overrides = {}) => ({
+  candidates: [{ content: { parts: [{ inlineData: { mimeType: "image/png", data: fixtures.png } }] }, finishReason: "STOP" }],
+  usageMetadata: { promptTokenCount: 7, candidatesTokenCount: 10, thoughtsTokenCount: 2 },
+  ...overrides,
+});
+const bananaPrompt = [...prompt, "--model", "banana"];
+const bananaEnv = { BANANA_API_KEY: "banana-local-key" };
+
+test("Banana adapter sends generateContent with its own key and normalizes usage", async (t) => {
+  const h = await harness(t, (req, res) => {
+    assert.equal(req.headers.authorization, "Bearer banana-local-key");
+    assert.equal(req.url, "/v1beta/models/gemini-nano-banana-2.1:generateContent");
+    const payload = JSON.parse(req.body);
+    assert.equal(payload.contents[0].parts[0].text, "local regression test");
+    assert.deepEqual(payload.generationConfig, {
+      responseModalities: ["IMAGE"], imageConfig: { imageSize: "1K", aspectRatio: "1:1" },
+      thinkingConfig: { thinkingLevel: "minimal" },
+    });
+    assert.equal(payload.n, undefined);
+    sendJSON(res, bananaResponse());
+  });
+  const r = await h.run(bananaPrompt, bananaEnv);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(r.result.images.length, 1);
+  const text = await fs.readFile(r.result.metadata_path, "utf8");
+  assert.deepEqual(JSON.parse(text).usage, { input_tokens: 7, output_tokens: 12 });
+  assert.doesNotMatch(text + r.stdout + r.stderr, /banana-local-key|local-test-key|iVBORw0KGgo/);
+});
+
+test("legacy dotenv drawing defaults, environment and CLI retain priority over preferences", async (t) => {
+  const h = await harness(t, (_req, res) => sendJSON(res, imageResponse()));
+  await preferenceFixture(h, { model: "flare", quality: "low", background: "opaque" });
+  await fs.writeFile(path.join(h.dir, ".env"), "GPT_IMAGE2_MODEL=sunburst\nGPT_IMAGE2_QUALITY=medium\n");
+  let r = await h.run(prompt);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(JSON.parse(h.requests[0].body).model, "gpt-image-2.5-sunburst");
+  assert.equal(JSON.parse(h.requests[0].body).quality, "medium");
+  r = await h.run([...prompt, "--quality", "max"], {
+    GPT_IMAGE2_MODEL: "flare", GPT_IMAGE2_BACKGROUND: "", GPT_IMAGE2_QUALITY: "high",
+  });
+  assert.equal(r.code, 0, r.stderr);
+  const body = JSON.parse(h.requests[1].body);
+  assert.equal(body.model, "gpt-image-2.5-flare");
+  assert.equal(body.quality, "max");
+  assert.equal(Object.hasOwn(body, "background"), false);
+});
+
+test("task snapshots override preferences without updating preference files", async (t) => {
+  const h = await harness(t, (_req, res) => sendJSON(res, imageResponse()));
+  const config = await preferenceFixture(h, { model: "flare", n: 4, quality: "max", background: "transparent" });
+  const preferenceFile = path.join(config, "extend.md");
+  const before = await fs.readFile(preferenceFile);
+  const snapshot = path.join(h.dir, "execution.json");
+  await fs.writeFile(snapshot, JSON.stringify({ schema_version: 1, request_defaults: taskDefaults }));
+  const r = await h.run([...prompt, "--execution-config", snapshot]);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(JSON.parse(h.requests[0].body).n, 1);
+  assert.equal(JSON.parse(h.requests[0].body).quality, "medium");
+  assert.deepEqual(await fs.readFile(preferenceFile), before);
+});
+
+test("malformed or service-bearing preferences stop before requests and remain unchanged", async (t) => {
+  const h = await harness(t, (_req, res) => sendJSON(res, imageResponse()));
+  const config = await preferenceFixture(h, { api_key: "fake-sensitive-value" });
+  const preferenceFile = path.join(config, "extend.md");
+  for (const text of [await fs.readFile(preferenceFile, "utf8"), "# Bad\n```json\ninvalid\n```\n"]) {
+    await fs.writeFile(preferenceFile, text);
+    const r = await h.run(prompt);
+    assert.notEqual(r.code, 0);
+    assert.doesNotMatch(r.stdout + r.stderr, /fake-sensitive-value/);
+    assert.equal(await fs.readFile(preferenceFile, "utf8"), text);
+  }
+  assert.equal(h.requests.length, 0);
+});
 
 for (const format of ["png", "jpeg", "webp"]) {
   test(`pure Base64 ${format}: actual extension, usage record, inline image`, async (t) => {
@@ -183,6 +451,18 @@ test("an ambiguous request timeout is not retried", async (t) => {
   assert.match(r.stderr, /未自动重发/);
 });
 
+test("transport failures retain their cause and remain non-retrying", async (t) => {
+  const h = await harness(t, (req, res) => res.destroy());
+  const r = await h.run(prompt);
+  assert.equal(r.code, 1);
+  assert.equal(h.requests.length, 1);
+  assert.match(r.result.errors.join(" "), /UND_ERR_SOCKET|other side closed/);
+  const record = JSON.parse(await fs.readFile(r.result.metadata_path, "utf8"));
+  assert.equal(record.attempts, 1);
+  assert.equal(record.transport_error.code, "UND_ERR_SOCKET");
+  assert.doesNotMatch(JSON.stringify(record), /local-test-key/);
+});
+
 test("Sunburst multipart edits keep references and save one output", async (t) => {
   const h = await harness(t, (_req, res) => sendJSON(res, imageResponse()));
   const ref = path.join(h.dir, "reference.png");
@@ -225,105 +505,122 @@ test("parallel local calls respect configured pacing and never overwrite files",
   for (let i = 1; i < h.requests.length; i += 1) assert.ok(h.requests[i].time - h.requests[i - 1].time >= 100);
 });
 
-const billedResponse = { ...imageResponse(), usage: { input_tokens: 7, output_tokens: 12 } };
-const billedRow = {
-  id: 123, request_id: "client:billing-test", model: "gpt-image-2.5-flare",
-  input_tokens: 7, output_tokens: 12, actual_cost: 0.07764,
-  rate_multiplier: 12, total_cost: 0.00647, api_key: { key: "local-test-key" },
-};
+const infoResponse = { ...imageResponse(), usage: { input_tokens: 7, output_tokens: 12 } };
 
-async function addBillingFixture(h, rows, target = h.baseUrl) {
-  const root = path.join(h.dir, "billing");
-  const cli = path.join(root, "scripts", "billing.cjs");
-  await fs.mkdir(path.dirname(cli), { recursive: true });
-  await fs.writeFile(path.join(root, ".env"), `HEIHUZI_ADMIN_BASE_URL=${target}\n`);
-  await fs.writeFile(path.join(root, "rows.json"), JSON.stringify(rows));
-  await fs.writeFile(cli, `
-const fs = require('node:fs');
-const path = require('node:path');
-const [command, method, route] = process.argv.slice(2);
-if (command !== 'api' || method !== 'GET' || !route.startsWith('/admin/usage?')) process.exit(2);
-fs.appendFileSync(path.join(__dirname, '../calls.txt'), route + '\\n');
-console.log(JSON.stringify({items: JSON.parse(fs.readFileSync(path.join(__dirname, '../rows.json'), 'utf8'))}));
-`);
-  return { cli, calls: path.join(root, "calls.txt") };
-}
-
-test("optional cost summary uses the precise billing ID and excludes pricing internals", async (t) => {
-  const h = await harness(t, (_req, res) => sendJSON(res, billedResponse, 200, {
-    "x-request-id": "gateway-id, upstream-id", "x-client-request-id": "billing-test",
-  }));
-  const billing = await addBillingFixture(h, [billedRow]);
-  const r = await h.run([...prompt, "--show-cost", "--cost-lookup-cli", billing.cli]);
+test("optional info summary includes requested ratio and saved count while preserving usage", async (t) => {
+  const h = await harness(t, (_req, res) => sendJSON(res, infoResponse));
+  const r = await h.run([...prompt, "--show-info"]);
   assert.equal(r.code, 0, r.stderr);
-  assert.equal(r.result.cost_summary.generation_cost.amount, 0.07764);
-  assert.equal(r.result.cost_summary.generation_cost.status, "confirmed");
-  const recordText = await fs.readFile(r.result.metadata_path, "utf8");
-  assert.equal(JSON.parse(recordText).client_request_id, "billing-test");
-  assert.match(await fs.readFile(billing.calls, "utf8"), /request_id=client%3Abilling-test/);
+  const { elapsed_seconds: elapsed, ...summary } = r.result.info_summary;
+  assert.ok(Number.isFinite(elapsed) && elapsed >= 0);
+  assert.deepEqual(summary, {
+    model: "gpt-image-2.5-flare", resolution: "2 × 2", quality: "low",
+    aspect_ratio: "1:1", aspect_ratio_source: "requested", image_count: 1, requested_count: 1,
+    output_format: "PNG", background: null,
+    input_tokens: 7, output_tokens: 12,
+  });
   const display = r.stdout.slice(r.stdout.lastIndexOf("模型：")).trim();
-  assert.equal(display, "模型：GPT Image 2.5 Flare\n分辨率：2 × 2\n质量：低（low）\n输入/输出 token：7 / 12\n生图费用：$0.07764");
+  assert.equal(display, `模型：GPT Image 2.5 Flare\n分辨率：2 × 2\n比例：1:1（请求比例）\n图片数量：1 张\n质量：低（low）\n输出格式：PNG\n背景：未指定\n总耗时：${elapsed.toFixed(2)} 秒（含保存）\n输入/输出 token：7 / 12`);
   assert.ok(r.stdout.indexOf("![生成图片 1]") < r.stdout.indexOf("模型："));
-  for (const text of [r.stdout, recordText]) {
-    assert.doesNotMatch(text, /rate_multiplier|total_cost|0\.00647|local-test-key|倍率/);
+  const record = JSON.parse(await fs.readFile(r.result.metadata_path, "utf8"));
+  assert.equal(record.usage.input_tokens, 7);
+  assert.equal(record.requested_aspect_ratio, "1:1");
+  assert.equal(record.requested_count, 1);
+  assert.equal(JSON.parse(h.requests[0].body).requested_aspect_ratio, undefined);
+  assert.equal(record.cost, undefined);
+  assert.equal(h.requests.length, 1);
+});
+
+test("no-info overrides enabled environment and preference defaults", async (t) => {
+  const h = await harness(t, (_req, res) => sendJSON(res, infoResponse));
+  await preferenceFixture(h, { show_info: true });
+  for (const env of [{}, { GPT_IMAGE2_SHOW_INFO: "true" }]) {
+    const r = await h.run([...prompt, "--no-info"], env);
+    assert.equal(r.code, 0, r.stderr);
+    assert.equal(r.result.info_summary, undefined);
+    assert.doesNotMatch(r.stdout, /模型：/);
   }
 });
 
-test("no-cost overrides an enabled default and does not query billing", async (t) => {
-  const h = await harness(t, (_req, res) => sendJSON(res, billedResponse, 200, { "x-client-request-id": "billing-test" }));
-  const billing = await addBillingFixture(h, [billedRow]);
-  const r = await h.run([...prompt, "--no-cost", "--cost-lookup-cli", billing.cli], { GPT_IMAGE2_SHOW_COST: "true" });
+test("enabled environment and preference defaults add info without a CLI flag", async (t) => {
+  const h = await harness(t, (_req, res) => sendJSON(res, infoResponse));
+  let r = await h.run(prompt, { GPT_IMAGE2_SHOW_INFO: "true" });
   assert.equal(r.code, 0, r.stderr);
-  assert.equal(r.result.cost_summary, undefined);
-  assert.doesNotMatch(r.stdout, /生图费用/);
-  await assert.rejects(fs.access(billing.calls));
+  assert.equal(r.result.info_summary.input_tokens, 7);
+  await preferenceFixture(h, { show_info: true });
+  r = await h.run(prompt);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(r.result.info_summary.output_tokens, 12);
 });
 
-test("an enabled configuration adds the summary without a CLI flag", async (t) => {
-  const h = await harness(t, (_req, res) => sendJSON(res, billedResponse, 200, { "x-client-request-id": "billing-test" }));
-  const billing = await addBillingFixture(h, [{ ...billedRow, actual_cost: 0 }]);
-  const r = await h.run([...prompt, "--cost-lookup-cli", billing.cli], { GPT_IMAGE2_SHOW_COST: "true" });
+test("missing token counts remain unknown while zero counts remain zero", async (t) => {
+  const h = await harness(t, (_req, res, count) => sendJSON(res, count === 1
+    ? imageResponse() : { ...imageResponse(), usage: { input_tokens: 0, output_tokens: 0 } }));
+  let r = await h.run([...prompt, "--show-info"]);
   assert.equal(r.code, 0, r.stderr);
-  assert.equal(r.result.cost_summary.generation_cost.amount, 0);
-  assert.match(r.stdout, /生图费用：\$0\.00/);
+  assert.equal(r.result.info_summary.input_tokens, null);
+  assert.equal(r.result.info_summary.output_tokens, null);
+  assert.match(r.stdout, /输入\/输出 token：未提供 \/ 未提供/);
+  r = await h.run([...prompt, "--show-info"]);
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stdout, /输入\/输出 token：0 \/ 0/);
 });
 
-for (const [label, rows] of [
-  ["wrong key", [{ ...billedRow, api_key: { key: "different-key" } }]],
-  ["wrong model", [{ ...billedRow, model: "gpt-image-2" }]],
-  ["wrong tokens", [{ ...billedRow, output_tokens: 99 }]],
-  ["missing actual cost", [{ ...billedRow, actual_cost: null }]],
-  ["negative actual cost", [{ ...billedRow, actual_cost: -1 }]],
-  ["ambiguous records", [billedRow, billedRow]],
-  ["pending billing", []],
-]) {
-  test(`${label}: keep the image and never report an unverified amount`, async (t) => {
-    const h = await harness(t, (_req, res) => sendJSON(res, billedResponse, 200, { "x-client-request-id": "billing-test" }));
-    const billing = await addBillingFixture(h, rows);
-    const r = await h.run([...prompt, "--show-cost", "--cost-lookup-cli", billing.cli]);
-    assert.equal(r.code, 0, r.stderr);
-    assert.equal(r.result.images.length, 1);
-    assert.equal(r.result.cost_summary.generation_cost.amount, null);
-    assert.match(r.stdout, /生图费用：暂未查到/);
-    assert.doesNotMatch(r.stdout, /生图费用：\$/);
+test("partial output info shows saved count separately from requested count", async (t) => {
+  const h = await harness(t, (_req, res) => sendJSON(res, imageResponse()));
+  const r = await h.run([...prompt, "-n", "2", "--aspect-ratio", "16:9", "--show-info"]);
+  assert.equal(r.code, 1);
+  assert.equal(r.result.status, "partial");
+  assert.equal(r.result.info_summary.image_count, 1);
+  assert.equal(r.result.info_summary.requested_count, 2);
+  assert.equal(r.result.info_summary.aspect_ratio, "16:9");
+  assert.equal(r.result.info_summary.resolution, "2 × 2");
+  assert.match(r.stdout, /比例：16:9（请求比例）/);
+  assert.match(r.stdout, /图片数量：已保存 1 张 \/ 请求 2 张/);
+});
+
+test("older records derive actual ratio and unknown sizes stay unknown", async () => {
+  const { buildInfoSummary, formatInfoSummary } = await import("./info-summary.mjs");
+  const summary = buildInfoSummary({
+    request: { n: 2 }, images: [{ width: 1280, height: 720 }],
   });
-}
-
-test("billing on a different service is never queried", async (t) => {
-  const h = await harness(t, (_req, res) => sendJSON(res, billedResponse, 200, { "x-client-request-id": "billing-test" }));
-  const billing = await addBillingFixture(h, [billedRow], "https://different.invalid");
-  const r = await h.run([...prompt, "--show-cost", "--cost-lookup-cli", billing.cli]);
-  assert.equal(r.code, 0, r.stderr);
-  assert.equal(r.result.cost_summary.generation_cost.amount, null);
-  await assert.rejects(fs.access(billing.calls));
+  assert.equal(summary.aspect_ratio, "16:9");
+  assert.equal(summary.aspect_ratio_source, "actual");
+  assert.match(formatInfoSummary(summary), /比例：16:9（实际比例）/);
+  const missing = buildInfoSummary({ images: [{ width: 0, height: 720 }] });
+  assert.equal(missing.aspect_ratio, null);
+  assert.match(formatInfoSummary(missing), /比例：未提供/);
 });
 
-test("missing billing access preserves successful image generation", async (t) => {
-  const h = await harness(t, (_req, res) => sendJSON(res, billedResponse, 200, { "x-client-request-id": "billing-test" }));
-  const r = await h.run([...prompt, "--show-cost", "--cost-lookup-cli", path.join(h.dir, "missing.cjs")]);
-  assert.equal(r.code, 0, r.stderr);
-  assert.equal(r.result.status, "success");
-  assert.match(r.stdout, /生图费用：暂未查到/);
+test("info uses saved formats, labels requested background and validates total timing", async () => {
+  const { buildInfoSummary, formatInfoSummary } = await import("./info-summary.mjs");
+  const base = {
+    request: { output_format: "jpeg", background: "transparent" },
+    images: [{ mime_type: "image/png" }, { mime_type: "image/webp" }],
+    elapsed_seconds: 1, timing: { total_seconds: 9.074 },
+  };
+  const summary = buildInfoSummary(base);
+  assert.equal(summary.output_format, "PNG、WebP");
+  assert.equal(summary.elapsed_seconds, 9.074);
+  assert.match(formatInfoSummary(summary), /背景：透明（请求设置）/);
+  assert.match(formatInfoSummary(summary), /总耗时：9\.07 秒（含保存）/);
+  for (const time of [undefined, null, -1, NaN, Infinity, "9"]) {
+    const invalid = buildInfoSummary({ images: [], timing: { total_seconds: time } });
+    assert.equal(invalid.elapsed_seconds, null);
+    assert.equal(invalid.output_format, null);
+    assert.match(formatInfoSummary(invalid), /总耗时：未提供/);
+  }
+  assert.equal(buildInfoSummary({ timing: { total_seconds: 0 } }).elapsed_seconds, 0);
+});
+
+test("removed billing CLI options fail locally before sending requests", async (t) => {
+  const h = await harness(t, (_req, res) => sendJSON(res, infoResponse));
+  for (const args of [["--show-cost"], ["--no-cost"], ["--cost-lookup-cli", "unused.mjs"]]) {
+    const r = await h.run([...prompt, ...args]);
+    assert.notEqual(r.code, 0);
+    assert.match(r.stderr, /未知参数/);
+  }
+  assert.equal(h.requests.length, 0);
 });
 
 test("an output path that is a file fails before a paid request", async (t) => {
@@ -336,9 +633,9 @@ test("an output path that is a file fails before a paid request", async (t) => {
 test("CLI values override invalid environment defaults before validation", async (t) => {
   const h = await harness(t, (_req, res) => sendJSON(res, imageResponse()));
   const r = await h.run([...prompt, "--model", "flare", "--quality", "medium", "-n", "1",
-    "--resolution", "1k", "--timeout-ms", "5000", "--no-cost"], {
+    "--resolution", "1k", "--timeout-ms", "5000", "--no-info"], {
     GPT_IMAGE2_MODEL: "broken-model", GPT_IMAGE2_QUALITY: "broken-quality", GPT_IMAGE2_N: "bad",
-    GPT_IMAGE2_RESOLUTION: "9k", GPT_IMAGE2_TIMEOUT_MS: "bad", GPT_IMAGE2_SHOW_COST: "bad",
+    GPT_IMAGE2_RESOLUTION: "9k", GPT_IMAGE2_TIMEOUT_MS: "bad", GPT_IMAGE2_SHOW_INFO: "bad",
   });
   assert.equal(r.code, 0, r.stderr);
   assert.equal(JSON.parse(h.requests[0].body).quality, "medium");
@@ -550,11 +847,44 @@ test("corrupt PNG chunk checksums are rejected", async (t) => {
   assert.equal((await h.run(prompt)).code, 1);
 });
 
+test("removed model is rejected from CLI, environment, dotenv, preferences and snapshots before requests", async (t) => {
+  const h = await harness(t, (_req, res) => sendJSON(res, imageResponse()));
+  const rejected = async (args, env = {}) => {
+    const r = await h.run([...prompt, ...args], env);
+    assert.equal(r.code, 1, r.stderr);
+    assert.match(r.stderr, /只能是 gpt-image-2\.5-flare.*gpt-image-2\.5-sunburst/);
+  };
+  await rejected(["--model", "gpt-image-2"]);
+  await rejected([], { GPT_IMAGE2_MODEL: "gpt-image-2" });
+  await fs.writeFile(path.join(h.dir, ".env"), "GPT_IMAGE2_MODEL=gpt-image-2\n");
+  await rejected([]);
+  await fs.unlink(path.join(h.dir, ".env"));
+  const config = path.join(h.dir, "execution.json");
+  await fs.writeFile(config, JSON.stringify({
+    schema_version: 1, request_defaults: { ...taskDefaults, GPT_IMAGE2_MODEL: "gpt-image-2" },
+  }));
+  await rejected(["--execution-config", config]);
+  await preferenceFixture(h, { model: "gpt-image-2" });
+  await rejected([]);
+  assert.equal(h.requests.length, 0);
+});
+
+test("Flare and Sunburst retain highest quality and transparent output", async (t) => {
+  const h = await harness(t, (_req, res) => sendJSON(res, imageResponse()));
+  for (const model of ["gpt-image-2.5-flare", "gpt-image-2.5-sunburst"]) {
+    const r = await h.run([...prompt, "--model", model, "--quality", "max", "--background", "transparent"]);
+    assert.equal(r.code, 0, r.stderr);
+    const body = JSON.parse(h.requests.at(-1).body.toString());
+    assert.equal(body.model, model);
+    assert.equal(body.quality, "max");
+    assert.equal(body.background, "transparent");
+    assert.equal(body.output_format, "png");
+  }
+});
+
 test("invalid parameter combinations and unreadable references never call the service", async (t) => {
   const h = await harness(t, (_req, res) => sendJSON(res, imageResponse()));
   for (const args of [
-    ["--model", "gpt-image-2", "--quality", "max"],
-    ["--model", "gpt-image-2", "--background", "transparent"],
     ["--background", "transparent", "--output-format", "jpeg"],
     ["--output-format", "png", "--output-compression", "50"],
     ["--max-retries", "11"],
@@ -597,10 +927,10 @@ test("actual model, dimensions and format override assumptions in the summary", 
   const h = await harness(t, (_req, res) => sendJSON(res, {
     model: "gpt-image-2.5-sunburst", data: [{ b64_json: fixtures.jpeg }],
   }));
-  const r = await h.run([...prompt, "--output-format", "png", "--show-cost"]);
+  const r = await h.run([...prompt, "--output-format", "png", "--show-info"]);
   assert.equal(r.code, 0, r.stderr);
-  assert.equal(r.result.cost_summary.model, "gpt-image-2.5-sunburst");
-  assert.equal(r.result.cost_summary.resolution, "2 × 2");
+  assert.equal(r.result.info_summary.model, "gpt-image-2.5-sunburst");
+  assert.equal(r.result.info_summary.resolution, "2 × 2");
   assert.ok(r.result.warnings.some((warning) => warning.includes("模型")));
   assert.ok(r.result.warnings.some((warning) => warning.includes("尺寸")));
   assert.ok(r.result.warnings.some((warning) => warning.includes("格式")));
@@ -643,4 +973,398 @@ test("unexpected extra reference-mode images are preserved instead of discarded"
   assert.ok(r.result.warnings.some((warning) => warning.includes("参考图")));
   assert.ok(r.result.warnings.some((warning) => warning.includes("计费")));
   assert.doesNotMatch(h.requests[0].body.toString(), /name="n"/);
+});
+
+test("command-line keys are rejected without echoing the supplied secret", async (t) => {
+  const h = await harness(t, (_req, res) => sendJSON(res, imageResponse()));
+  for (const args of [["--api-key", "private-cli-key"], ["--api-key=private-cli-key"]]) {
+    const r = await h.run([...prompt, ...args]);
+    assert.equal(r.code, 1);
+    assert.doesNotMatch(r.stdout + r.stderr, /private-cli-key/);
+  }
+  assert.equal(h.requests.length, 0);
+});
+
+test("unsupported protocol modes never send requests", async (t) => {
+  const h = await harness(t, (_req, res) => sendJSON(res, imageResponse()));
+  for (const mode of ["official-compatible", "official", "openai", "openai-compatible"]) {
+    assert.equal((await h.run([...prompt, "--mode", mode])).code, 1);
+    assert.equal((await h.run(prompt, { GPT_IMAGE2_MODE: mode })).code, 1);
+  }
+  const config = path.join(h.dir, "execution.json");
+  await fs.writeFile(config, JSON.stringify({
+    schema_version: 1, request_defaults: { ...taskDefaults, GPT_IMAGE2_MODE: "official-compatible" },
+  }));
+  assert.equal((await h.run([...prompt, "--execution-config", config])).code, 1);
+  assert.equal(h.requests.length, 0);
+});
+
+test("count limits apply to CLI, environment, dotenv, preferences and snapshots", async (t) => {
+  const h = await harness(t, (_req, res) => sendJSON(res, imageResponse()));
+  for (const count of ["0", "5", "999999"]) {
+    assert.equal((await h.run([...prompt, "-n", count])).code, 1);
+    assert.equal((await h.run(prompt, { GPT_IMAGE2_N: count })).code, 1);
+  }
+  const legacy = path.join(h.dir, ".env");
+  await fs.writeFile(legacy, "GPT_IMAGE2_N=5\n");
+  assert.equal((await h.run(prompt)).code, 1);
+  await fs.unlink(legacy);
+  const config = path.join(h.dir, "execution.json");
+  await fs.writeFile(config, JSON.stringify({
+    schema_version: 1, request_defaults: { ...taskDefaults, GPT_IMAGE2_N: 5 },
+  }));
+  assert.equal((await h.run([...prompt, "--execution-config", config])).code, 1);
+  await preferenceFixture(h, { n: 5 });
+  assert.equal((await h.run(prompt)).code, 1);
+  assert.equal(h.requests.length, 0);
+});
+
+test("cross-origin delivery cannot reach a second local server or private targets", async (t) => {
+  const target = await harness(t, (_req, res) => sendJSON(res, imageResponse()));
+  const urls = [
+    `${target.baseUrl}/private`, "http://localhost/private", "http://169.254.169.254/latest/meta-data",
+    "http://10.0.0.1/private", "http://[::1]/private", "https://cdn.example.invalid/image.png",
+    "http://2130706433/private", "file:///secret",
+  ];
+  const h = await harness(t, (_req, res) => sendJSON(res, {
+    data: urls.map((url) => ({ url })),
+  }));
+  const r = await h.run(prompt);
+  assert.equal(r.code, 1);
+  assert.equal(r.result.images.length, 0);
+  assert.equal(h.requests.length, 1);
+  assert.equal(target.requests.length, 0);
+});
+
+test("same-origin image redirects are rejected without following the destination", async (t) => {
+  let baseUrl;
+  const h = await harness(t, (req, res) => {
+    if (req.method === "POST") sendJSON(res, { data: [{ url: `${baseUrl}/redirect` }] });
+    else { res.writeHead(302, { location: `${baseUrl}/destination` }); res.end(); }
+  });
+  baseUrl = h.baseUrl;
+  const r = await h.run(prompt);
+  assert.equal(r.code, 1);
+  assert.equal(h.requests.length, 2);
+  assert.equal(h.requests.some((req) => req.url === "/destination"), false);
+});
+
+test("unsupported reference formats fail locally even when the magic is recognized", async (t) => {
+  const h = await harness(t, (_req, res) => sendJSON(res, imageResponse()));
+  for (const [extension, raw] of [
+    ["gif", Buffer.from("GIF89a" + "\0".repeat(32))],
+    ["bmp", Buffer.from("BM" + "\0".repeat(32))],
+    ["tiff", Buffer.from([0x49, 0x49, 0x2a, 0, ...new Array(32).fill(0)])],
+  ]) {
+    const ref = path.join(h.dir, `reference.${extension}`);
+    await fs.writeFile(ref, raw);
+    assert.equal((await h.run([...prompt, "--image", ref])).code, 1);
+  }
+  assert.equal(h.requests.length, 0);
+});
+
+test("private metadata hides structured paths while results remain previewable", async (t) => {
+  const h = await harness(t, (_req, res) => sendJSON(res, imageResponse()));
+  const ref = path.join(h.dir, "reference.png");
+  await fs.writeFile(ref, Buffer.from(fixtures.png, "base64"));
+  for (const [args, env] of [
+    [["--private-metadata"], {}],
+    [[], { GPT_IMAGE2_PRIVATE_METADATA: "true" }],
+  ]) {
+    const r = await h.run([...prompt, "--image", ref, ...args], env);
+    assert.equal(r.code, 0, r.stderr);
+    assert.ok(path.isAbsolute(r.result.images[0].path));
+    const text = await fs.readFile(r.result.metadata_path, "utf8");
+    const record = JSON.parse(text);
+    assert.equal(record.reference_images[0].path, "reference.png");
+    assert.equal(record.images[0].path, path.basename(r.result.images[0].path));
+    assert.equal(text.includes(JSON.stringify(h.root).slice(1, -1)), false);
+    assert.deepEqual(await fs.readFile(r.result.images[0].path), Buffer.from(fixtures.png, "base64"));
+  }
+});
+
+test("model discovery is offline and independent of broken or private configuration", async (t) => {
+  const h = await harness(t, (_req, res) => sendJSON(res, imageResponse()));
+  await preferenceFixture(h, { model: "not-a-model" });
+  for (const command of ["models", "--models"]) {
+    const r = await h.run([command], { BANANA_API_KEY: "secret-model-key", GPT_IMAGE2_N: "broken" });
+    assert.equal(r.code, 0, r.stderr);
+    const models = JSON.parse(r.stdout).models;
+    assert.deepEqual(models.map((model) => model.alias), ["flare", "sunburst", "banana"]);
+    assert.equal(models[2].maxReferences, 14);
+    assert.equal(models[2].transparent, false);
+    assert.ok(models[2].ratios.includes("1:8"));
+    assert.doesNotMatch(r.stdout, /secret-model-key/);
+  }
+  assert.equal(h.requests.length, 0);
+});
+
+test("Banana has independent key readiness, local dotenv and environment precedence", async (t) => {
+  const h = await harness(t, (_req, res) => sendJSON(res, bananaResponse()));
+  let r = await h.run(bananaPrompt);
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /BANANA_API_KEY/);
+  assert.equal(h.requests.length, 0);
+  r = await h.run(["--check-config", "--model", "banana"]);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(JSON.parse(r.stdout).configured, false);
+  assert.deepEqual(JSON.parse(r.stdout).providers, { gpt: true, banana: false });
+  await fs.writeFile(path.join(h.dir, ".env"), "BANANA_API_KEY=dotenv-banana-key\n");
+  r = await h.run(bananaPrompt);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(h.requests[0].headers.authorization, "Bearer dotenv-banana-key");
+  r = await h.run(bananaPrompt, bananaEnv);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(h.requests[1].headers.authorization, "Bearer banana-local-key");
+  r = await h.run(["--check-config", "--model", "banana"], { BANANA_API_KEY: "" });
+  assert.equal(JSON.parse(r.stdout).configured, false);
+  r = await h.run(["check"], bananaEnv);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(JSON.parse(r.stdout).providers.banana, true);
+  assert.doesNotMatch(r.stdout + r.stderr, /dotenv-banana-key|banana-local-key/);
+});
+
+test("Banana reference input uses inlineData and one output with validated bytes", async (t) => {
+  const h = await harness(t, (req, res) => {
+    const payload = JSON.parse(req.body);
+    assert.deepEqual(payload.contents[0].parts[1].inlineData, {
+      mimeType: "image/png", data: fixtures.png,
+    });
+    assert.equal(payload.generationConfig.imageConfig.aspectRatio, "1:4");
+    assert.equal(payload.generationConfig.thinkingConfig, undefined);
+    sendJSON(res, bananaResponse());
+  });
+  const ref = path.join(h.dir, "参考图.png");
+  await fs.writeFile(ref, Buffer.from(fixtures.png, "base64"));
+  const r = await h.run([...bananaPrompt, "--image", ref, "-n", "4",
+    "--quality", "high", "--aspect-ratio", "1:4", "--private-metadata"], bananaEnv);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(h.requests.length, 1);
+  assert.equal(r.result.images.length, 1);
+  assert.ok(r.result.warnings.some((warning) => warning.includes("参考图")));
+  const text = await fs.readFile(r.result.metadata_path, "utf8");
+  assert.doesNotMatch(text, /iVBORw0KGgo/);
+  assert.equal(JSON.parse(text).reference_images[0].path, "参考图.png");
+});
+
+test("Banana-specific limits and unsupported GPT options stop before requests", async (t) => {
+  const h = await harness(t, (_req, res) => sendJSON(res, bananaResponse()));
+  for (const args of [
+    ["--background", "transparent"], ["--output-format", "webp"],
+    ["--output-format", "jpeg"], ["--output-compression", "0"], ["--moderation", "low"],
+    ["--aspect-ratio", "2:1"], ["--concurrency", "0"], ["--concurrency", "5"],
+    Array.from({ length: 15 }, () => ["--image", "unused.png"]).flat(),
+  ]) {
+    const r = await h.run([...bananaPrompt, ...args], bananaEnv);
+    assert.equal(r.code, 1, JSON.stringify(args));
+  }
+  const gpt = await h.run([...prompt, "--aspect-ratio", "1:8"]);
+  assert.equal(gpt.code, 1);
+  assert.equal(h.requests.length, 0);
+});
+
+test("Banana dry-run aliases preserve Unicode prompts and never submit or save output", async (t) => {
+  const h = await harness(t, (_req, res) => sendJSON(res, bananaResponse()));
+  for (const alias of ["banana", "nano-banana", "nano-banana-2.1", "gemini-nano-banana-2.1", "香蕉"]) {
+    const r = await h.run(["--model", alias, "--prompt", "春天的海报 🌸", "--dry-run",
+      "--aspect-ratio", "8:1", "-n", "3"], { GPT_IMAGE2_API_KEY: "", BANANA_API_KEY: "" });
+    assert.equal(r.code, 0, r.stderr);
+    assert.match(r.stdout, /gemini-nano-banana-2\.1:generateContent/);
+    assert.match(r.stdout, /"request_count": 3/);
+    assert.match(r.stdout, /春天的海报 🌸/);
+  }
+  assert.equal(h.requests.length, 0);
+  await assert.rejects(fs.access(h.outDir));
+});
+
+test("Banana bounded workers save each request and preserve order despite out-of-order responses", async (t) => {
+  let active = 0, peak = 0;
+  const h = await harness(t, async (_req, res, count) => {
+    active++;
+    peak = Math.max(peak, active);
+    const files = await fs.readdir(h.outDir);
+    const record = JSON.parse(await fs.readFile(path.join(h.outDir, files.find((name) => name.endsWith(".json"))), "utf8"));
+    assert.equal(record.subrequests[count - 1].status, "pending");
+    if (count === 3) assert.ok(files.some((name) => name.endsWith(".png")), "earlier image is already saved");
+    await new Promise((resolve) => setTimeout(resolve, count === 1 ? 220 : 40));
+    sendJSON(res, bananaResponse({ modelVersion: `banana-result-${count}` }), 200, { "x-request-id": `banana-${count}` });
+    active--;
+  });
+  const r = await h.run([...bananaPrompt, "-n", "4"], bananaEnv);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(peak, 2);
+  assert.equal(h.requests.length, 4);
+  assert.deepEqual(r.result.images.map((image) => image.model),
+    ["banana-result-1", "banana-result-2", "banana-result-3", "banana-result-4"]);
+  const record = JSON.parse(await fs.readFile(r.result.metadata_path, "utf8"));
+  assert.deepEqual(record.usage, { input_tokens: 28, output_tokens: 48 });
+  assert.deepEqual(record.subrequests.map((item) => item.request_id), ["banana-1", "banana-2", "banana-3", "banana-4"]);
+  assert.ok(record.subrequests.every((item) => item.status === "success"));
+});
+
+test("Banana single worker respects configured concurrency and retains partial success", async (t) => {
+  const h = await harness(t, (_req, res, count) => {
+    if (count === 2) sendJSON(res, { error: { message: "provider failure" } }, 500);
+    else sendJSON(res, bananaResponse());
+  });
+  const r = await h.run([...bananaPrompt, "-n", "3", "--concurrency", "1"], bananaEnv);
+  assert.equal(r.code, 1);
+  assert.equal(h.requests.length, 3);
+  assert.equal(r.result.status, "partial");
+  assert.deepEqual(r.result.images.map((image) => image.request_index), [1, 3]);
+  const record = JSON.parse(await fs.readFile(r.result.metadata_path, "utf8"));
+  assert.deepEqual(record.subrequests.map((item) => item.status), ["success", "failed", "success"]);
+  assert.deepEqual(record.usage, { input_tokens: null, output_tokens: null });
+});
+
+test("Banana shares one generation deadline and does not submit queued requests after timeout", async (t) => {
+  const h = await harness(t, (_req, res, count) => {
+    if (count === 1) sendJSON(res, bananaResponse());
+  });
+  const r = await h.run([...bananaPrompt, "-n", "4", "--concurrency", "1", "--timeout-ms", "400"], bananaEnv);
+  assert.equal(r.code, 1);
+  assert.equal(h.requests.length, 2);
+  assert.equal(r.result.images.length, 1);
+  assert.equal(r.result.status, "partial");
+  const record = JSON.parse(await fs.readFile(r.result.metadata_path, "utf8"));
+  assert.deepEqual(record.subrequests.map((item) => item.status), ["success", "failed", "not_sent", "not_sent"]);
+});
+
+for (const [label, response] of [
+  ["blocked", bananaResponse({ candidates: [], promptFeedback: { blockReason: "SAFETY" } })],
+  ["thought only", bananaResponse({ candidates: [{ content: { parts: [
+    { thought: true, inlineData: { data: fixtures.png } },
+  ] }, finishReason: "NO_IMAGE" }] })],
+  ["truncated image", bananaResponse({ candidates: [{ content: { parts: [
+    { inlineData: { data: Buffer.from(fixtures.png, "base64").subarray(0, 24).toString("base64") } },
+  ] } }] })],
+]) {
+  test(`Banana ${label} records failure and usage without generating again`, async (t) => {
+    const h = await harness(t, (_req, res) => sendJSON(res, response, 200, { "x-request-id": "blocked-id" }));
+    const r = await h.run(bananaPrompt, bananaEnv);
+    assert.equal(r.code, 1);
+    assert.equal(h.requests.length, 1);
+    assert.equal(r.result.images.length, 0);
+    const record = JSON.parse(await fs.readFile(r.result.metadata_path, "utf8"));
+    assert.equal(record.request_id, "blocked-id");
+    assert.deepEqual(record.usage, { input_tokens: 7, output_tokens: 12 });
+    assert.equal(record.subrequests[0].status, "failed");
+    if (label === "blocked") assert.match(r.result.errors.join(" "), /SAFETY/);
+  });
+}
+
+test("Banana uses bounded 429 retries and retains exact request metadata", async (t) => {
+  const h = await harness(t, (_req, res, count) => {
+    if (count === 1) sendJSON(res, { error: { code: "rate_limit_exceeded" } }, 429, { "retry-after": "0" });
+    else sendJSON(res, bananaResponse(), 200, { "x-request-id": "banana-retried" });
+  });
+  const r = await h.run(bananaPrompt, bananaEnv);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(h.requests.length, 2);
+  assert.deepEqual(h.requests[0].body, h.requests[1].body);
+  const record = JSON.parse(await fs.readFile(r.result.metadata_path, "utf8"));
+  assert.equal(record.attempts, 2);
+  assert.equal(record.subrequests[0].request_id, "banana-retried");
+});
+
+test("Banana execution snapshots use the independent environment key and honor model-specific ratios", async (t) => {
+  const h = await harness(t, (_req, res) => sendJSON(res, bananaResponse()));
+  const config = path.join(h.dir, "execution.json");
+  await fs.writeFile(config, JSON.stringify({ schema_version: 1, request_defaults: {
+    ...taskDefaults, GPT_IMAGE2_MODEL: "gemini-nano-banana-2.1", GPT_IMAGE2_ASPECT_RATIO: "4:1",
+  } }));
+  const r = await h.run([...prompt, "--execution-config", config], bananaEnv);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(h.requests[0].headers.authorization, "Bearer banana-local-key");
+  assert.equal(JSON.parse(h.requests[0].body).generationConfig.imageConfig.aspectRatio, "4:1");
+});
+
+test("Banana batch info reports total tokens and provider-specific thinking quality", async (t) => {
+  const h = await harness(t, (_req, res) => sendJSON(res, bananaResponse()));
+  const r = await h.run([...bananaPrompt, "-n", "2", "--show-info"], bananaEnv);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(r.result.info_summary.input_tokens, 14);
+  assert.equal(r.result.info_summary.output_tokens, 24);
+  assert.equal(r.result.info_summary.quality, "minimal_thinking");
+  assert.equal(r.result.info_summary.image_count, 2);
+  assert.equal(r.result.info_summary.requested_count, 2);
+  assert.match(r.stdout, /最低思考档/);
+  assert.equal(h.requests.length, 2);
+});
+
+test("Banana chunked encoder preserves bytes across base64 boundaries and enforces its upload cap", async () => {
+  const { encodeBananaRequest, MAX_BANANA_REQUEST_BYTES } = await import("./banana-image.mjs");
+  const options = { prompt: '中文 "quoted"\n🌸', resolution: "2k", aspectRatio: "1:4", quality: "high" };
+  for (const length of [49151, 49152, 49153, 98305]) {
+    const raw = Buffer.alloc(length, 233);
+    const payload = JSON.parse(encodeBananaRequest(options, [{ mimeType: "image/png", raw }]).toString("utf8"));
+    assert.equal(payload.contents[0].parts[0].text, options.prompt);
+    assert.deepEqual(Buffer.from(payload.contents[0].parts[1].inlineData.data, "base64"), raw);
+    assert.equal(payload.generationConfig.thinkingConfig, undefined);
+  }
+  const huge = Buffer.alloc(Math.ceil(MAX_BANANA_REQUEST_BYTES * 3 / 4));
+  assert.throws(() => encodeBananaRequest(options, [{ mimeType: "image/png", raw: huge }]), /95MB/);
+});
+
+test("large Base64 output decodes across chunks and preserves the actual image bytes", async (t) => {
+  const jpeg = Buffer.from(fixtures.jpeg, "base64");
+  const comment = Buffer.alloc(50000, 97);
+  const header = Buffer.from([0xff, 0xfe, 0, 0]);
+  header.writeUInt16BE(comment.length + 2, 2);
+  const raw = Buffer.concat([jpeg.subarray(0, 2), header, comment, jpeg.subarray(2)]);
+  const h = await harness(t, (_req, res) => sendJSON(res, { data: [{ b64_json: raw.toString("base64") }] }));
+  const r = await h.run(prompt);
+  assert.equal(r.code, 0, r.stderr);
+  assert.deepEqual(await fs.readFile(r.result.images[0].path), raw);
+});
+
+test("Banana metadata failure preserves the saved image and stops all unstarted requests", async (t) => {
+  const h = await harness(t, async (_req, res) => {
+    const name = (await fs.readdir(h.outDir)).find((file) => file.endsWith(".json"));
+    await fs.unlink(path.join(h.outDir, name));
+    await fs.mkdir(path.join(h.outDir, name));
+    sendJSON(res, bananaResponse());
+  });
+  const r = await h.run([...bananaPrompt, "-n", "4", "--concurrency", "1"], bananaEnv);
+  assert.equal(r.code, 1);
+  assert.equal(r.result.status, "partial");
+  assert.equal(r.result.images.length, 1);
+  assert.equal(r.result.metadata_path, null);
+  assert.equal(h.requests.length, 1);
+  assert.deepEqual(await fs.readFile(r.result.images[0].path), Buffer.from(fixtures.png, "base64"));
+});
+
+test("Banana pacing beyond the deadline is recorded as not sent", async (t) => {
+  const h = await harness(t, (_req, res) => sendJSON(res, bananaResponse()));
+  const r = await h.run([...bananaPrompt, "-n", "2", "--concurrency", "1",
+    "--min-interval-ms", "1000", "--timeout-ms", "500"], bananaEnv);
+  assert.equal(r.code, 1);
+  assert.equal(h.requests.length, 1);
+  const record = JSON.parse(await fs.readFile(r.result.metadata_path, "utf8"));
+  assert.equal(record.subrequests[1].status, "not_sent");
+  assert.equal(record.subrequests[1].submitted, false);
+});
+
+test("Banana unknown token fields never become zero or partial totals", async () => {
+  const { parseBananaResponse } = await import("./banana-image.mjs");
+  for (const usageMetadata of [
+    {}, { promptTokenCount: true, candidatesTokenCount: "10" },
+    { promptTokenCount: -1, candidatesTokenCount: 10, thoughtsTokenCount: "2" },
+  ]) {
+    const response = parseBananaResponse(bananaResponse({ usageMetadata }));
+    assert.deepEqual(response.usage, { input_tokens: null, output_tokens: null });
+  }
+  assert.deepEqual(parseBananaResponse(bananaResponse({
+    usageMetadata: { promptTokenCount: 0, candidatesTokenCount: 0 },
+  })).usage, { input_tokens: 0, output_tokens: 0 });
+});
+
+test("Banana batch info does not report incomplete token totals as complete", async (t) => {
+  const h = await harness(t, (_req, res, count) => sendJSON(res,
+    count === 1 ? bananaResponse() : bananaResponse({ usageMetadata: {} })));
+  const r = await h.run([...bananaPrompt, "-n", "2", "--show-info"], bananaEnv);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(r.result.info_summary.input_tokens, null);
+  assert.equal(r.result.info_summary.output_tokens, null);
+  assert.match(r.stdout, /输入\/输出 token：未提供 \/ 未提供/);
 });

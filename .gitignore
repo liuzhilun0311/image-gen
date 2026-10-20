@@ -1,10 +1,16 @@
 # Local secrets and runtime configuration
 scripts/.env
+config/.env
+config/.env.*
+!config/.env.example
+config/extend.md
 .env
 .env.*
 !.env.example
 
 # Generated image outputs
+image_output/
+scripts/image_output/
 image2_output/
 scripts/image2_output/
 gpt-image2_*.json

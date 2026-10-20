@@ -104,12 +104,38 @@ function retryDelay(response, attempt) {
   return Math.min(30_000, 1000 * 2 ** (attempt - 1)) + Math.floor(Math.random() * 250);
 }
 
+function transportDetails(error, apiKey) {
+  const queue = [error.cause ?? error];
+  const seen = new Set();
+  const causes = [];
+  while (queue.length && causes.length < 6) {
+    const cause = queue.shift();
+    if (!cause || seen.has(cause)) continue;
+    seen.add(cause);
+    const message = String(cause.message ?? cause).split(apiKey).join("[redacted]").slice(0, 500);
+    const code = typeof cause.code === "string" ? cause.code.split(apiKey).join("[redacted]") : null;
+    causes.push({ code, message });
+    if (cause.cause) queue.push(cause.cause);
+    if (Array.isArray(cause.errors)) queue.push(...cause.errors.slice(0, 6));
+  }
+  return { code: causes.find(cause => cause.code)?.code ?? null, causes };
+}
+
 export async function requestImageJSON(url, makeBody, contentType, options) {
-  const deadline = Date.now() + options.timeoutMs;
+  const deadline = options.deadline ?? Date.now() + options.timeoutMs;
   for (let attempt = 1; ; attempt += 1) {
-    await waitForRequestSlot(url, options.apiKey, options.minIntervalMs, deadline);
+    try {
+      await waitForRequestSlot(url, options.apiKey, options.minIntervalMs, deadline);
+    } catch (error) {
+      error.metadata = { attempts: attempt - 1, submitted: attempt > 1 };
+      throw error;
+    }
     const remainingMs = deadline - Date.now();
-    if (remainingMs <= 0) throw new Error("图片请求超时；没有自动重发生成请求");
+    if (remainingMs <= 0) {
+      const error = new Error("图片请求超时；没有自动重发生成请求");
+      error.metadata = { attempts: attempt - 1, submitted: attempt > 1 };
+      throw error;
+    }
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), remainingMs);
     let response;
@@ -129,14 +155,19 @@ export async function requestImageJSON(url, makeBody, contentType, options) {
       text = (await readLimitedBody(response, response.ok ? 192 * 1024 * 1024 : 1024 * 1024)).toString("utf8");
       try { body = text ? JSON.parse(text) : null; } catch { body = null; }
     } catch (error) {
-      const failure = new Error(`图片请求失败或超时，未自动重发，请先核对生成记录：${error.message}`);
-      failure.metadata = { ...(response ? responseMetadata(response) : {}), attempts: attempt };
+      const transport = transportDetails(error, options.apiKey);
+      const detail = transport.causes.map(cause => [cause.code, cause.message].filter(Boolean).join(": ")).join("; ");
+      const failure = new Error(`图片请求失败或超时，未自动重发，请先核对生成记录：${error.message}；${detail}`);
+      failure.metadata = {
+        ...(response ? responseMetadata(response) : {}),
+        attempts: attempt, submitted: true, transport_error: transport,
+      };
       throw failure;
     } finally {
       clearTimeout(timer);
     }
 
-    const metadata = { ...responseMetadata(response), attempts: attempt };
+    const metadata = { ...responseMetadata(response), attempts: attempt, submitted: true };
     if (response.ok) {
       if (!body || typeof body !== "object" || Array.isArray(body)) {
         const error = new Error("接口返回了空响应或非 JSON 对象");

@@ -4,67 +4,79 @@
 
 `image-gen` 是一个通过配置的图片服务接口生成图片的技能。用自然语言描述想画什么，或提供参考图，就可以生成图片、保存到本地，并在对话中查看结果。支持设置清晰度、画质档位、画面比例和生成张数。
 
+支持 Flare、Sunburst 和 Nano Banana 三种模型。模型、格式、比例及参考图限制见 [config/extend.md](config/extend.md)，运行 `node scripts/gpt-image2.mjs models` 可离线查询脚本能力。
+
+## 文件分工
+
+| 文件 | 负责内容 | 修改方式 |
+| --- | --- | --- |
+| `config/.env` | 服务地址、密钥、运行控制和隐私配置及逐项说明 | 在本机修改对应赋值 |
+| `config/extend.md` | 绘图默认值、完整选项、模型限制及任务输入说明 | 修改上方 JSON；下方表格用于说明与记录 |
+| `README.md` | 安装、首次配置步骤、常见用法和故障处理 | 使用指南，不作为配置读取 |
+| `SKILL.md` | 给智能体的请求理解、执行流程、调用协议和结果处理规则 | 执行指引，不维护另一套默认值 |
+
+`.example` 文件仅供缺少配置时复制；脚本实际读取 `.env` 和 `extend.md`。脚本中的内置默认值用于缺失配置时兜底，固定能力限制由代码校验。
+
 ## 技能安装
 
 按所用平台的技能安装方式操作，可尝试以下方式：
 
-- **放入技能目录**：在 Codex、WorkBuddy、Trae 等支持本地技能的平台，将完整的技能文件夹命名为 `image-gen` 后放到对应技能目录，具体位置以平台设置为准。Codex 的 Windows 默认位置为 `C:\Users\用户名\.codex\skills\image-gen`，将“用户名”替换为自己的 Windows 用户名。
+- **放入技能目录**：在 Codex、WorkBuddy、Trae 等支持本地技能的平台，将完整的技能文件夹image-gen` 放到对应技能目录，具体位置以平台设置为准。Codex 的 Windows 默认位置为 `C:\Users\用户名\.codex\skills\image-gen`，将“用户名”替换为自己的 Windows 用户名。
 - **让智能体协助安装**：将技能压缩包交给智能体，告诉它：“请将这个技能安装到当前平台的技能目录”，平台需支持读取压缩包和操作本地文件。
 
-安装后的 `image-gen` 文件夹内应直接包含 `SKILL.md`、`README.md`、`scripts`、`agents` 和 `assets`；请保留完整文件夹。
+安装后的 `image-gen` 文件夹内应直接包含 `SKILL.md`、`README.md`、`config`、`scripts`、`agents` 和 `assets`；请保留完整文件夹。
 
 备注：建议使用 Node.js 22 或更新版本，需要支持 `fetch`、`FormData` 和 `Blob`，无需额外安装 npm 依赖。
 
 ## 首次配置
 
-1. **注册账号**：打开作者推荐的链接完成注册（已有账号可以直接登录）；
+1. **准备配置文件.env**：打开技能的 `config` 文件夹。若缺少 `.env` 时，复制`.env.example` 并修改为 `.env` 。若已存在 `.env` ，则忽略此步骤；
 
-   https://code.heihuzi.ai/register?aff=L5JCRAHZ4BGQ
+2. **获取 API Key**：
 
-2. **首充尝试**：建议先充值 **5 元**，少量体验生图效果和使用流程；如果不合适，及时止损。充值入口和金额以平台当前页面为准。
+   1. **注册账号**：打开链接完成注册（已有账号可以直接登录）；
 
-   ![先充值 5 元尝试使用](assets/first-recharge-guide.png)
+      https://code.heihuzi.ai/register?aff=L5JCRAHZ4BGQ
 
-3. **获取 API Key**：登录服务平台，进入“API 密钥”，点击“创建密钥”，填写名称，选择“OpenAI”和支持图片生成的分组，点击“创建”，然后复制生成的 API 密钥。操作顺序见下图，具体以当前页面为准。
+   2. **充值体验**：注册后，登录该服务平台，点击 **余额充值** ，按平台当前页面选择合适金额，先少量体验生图效果和使用流程；
 
-   ![创建并复制 API 密钥的操作步骤](assets/api-key-guide.png)
+   3. 点击**API 密钥**；
 
-4. **复制配置模板**：打开技能的 `scripts` 文件夹，将 `.env.example` 复制一份，重命名为 `.env`。已有 `.env` 时直接编辑，不要覆盖。
+   4. 点击**创建密钥**；
 
-5. **编辑 `.env`**：模板已预填接口地址，只需将自己的 API Key 填在 `GPT_IMAGE2_API_KEY=` 后面并保存。若使用其他兼容服务，再修改 `GPT_IMAGE2_BASE_URL`。其余参数可按需调整，单次画图要求会覆盖对应默认设置，不必每次修改 `.env`。
+   5. 填写密钥**名称**；
+
+   6. 配置厂商，若配置gpt-image-2.5-flare、sunburst，选择 **OpenAI**；若配置gemini-nano-banana， 选择 **其他**；
+
+   7. 点击 **选择分组**，若厂商选择OpenAI，分组选择 **image-2.5** 类分组；若厂商选择其他，选择 **Banana** 类分组；
+
+   8. 其他设置按需配置；
+
+   9. 点击 **创建**；
+
+   10. 复制API密钥 （点击API密钥右侧复制按钮即可复制）
+
+3. **编辑 `.env`**：将复制的API密钥填写相应的 Key 并保存；不用的模型可以留空 (强烈建议两个模型均配置，使用时按需切换)；
 
    ```dotenv
-   GPT_IMAGE2_API_KEY=你的API密钥
+   FLARE_SUNBURST_API_KEY=你的API密钥
+   BANANA_API_KEY=你的Banana分组密钥
    ```
 
-技能安装后，没有配置 API Key 时，智能体会给出注册和配置步骤；支持打开本地文档的平台也会展示这份说明。
+   也可以在对话中明确提供 Key，由技能写入本机 `config/.env`；推荐优先在本地填写，避免 Key 出现在对话记录中。
+   `.env` 还管理超时、重试、请求间隔、并发和隐私记录等运行配置，请按需配置。
 
-## 参数含义
+4. **准备配置文件.extend.md**：打开技能的 `config` 文件夹。若缺少 `.extend.md` 时，复制`.extend.example.md` 并修改为 `.extend.md` 。若已存在 `.extend.md` ，则忽略此步骤；
 
-| 参数 | 含义 |
-| --- | --- |
-| `GPT_IMAGE2_BASE_URL` | 画图服务 API 基础地址，模板已填 `https://code.heihuzi.ai/`；不是注册链接 |
-| `GPT_IMAGE2_API_KEY` | 你的 API 密钥，必须填写 |
-| `GPT_IMAGE2_MODEL` | 默认模型：`gpt-image-2.5-flare`；可改为更精细的 `gpt-image-2.5-sunburst`，或旧模型 `gpt-image-2` |
-| `GPT_IMAGE2_MODE` | 请求模式，日常保持 `current`；`official-compatible` 用于兼容接口测试 |
-| `GPT_IMAGE2_N` | 默认生成张数，`1` 表示一张 |
-| `GPT_IMAGE2_RESOLUTION` | 清晰度档位：`1k`、`2k`、`4k` |
-| `GPT_IMAGE2_ASPECT_RATIO` | 宽高比：`1:1` 方图、`16:9` 横图、`9:16` 竖图，也支持 `3:4` 等比例 |
-| `GPT_IMAGE2_QUALITY` | 质量：`auto`、`low`、`medium`、`high`；flare/sunburst 还支持 `xhigh`、`max`。模板为 `LOW`，脚本会按 `low` 处理；`current` 模式留空也为 `low` |
-| `GPT_IMAGE2_BACKGROUND` | 背景：`auto` 自动、`opaque` 不透明、`transparent` 透明；留空不指定 |
-| `GPT_IMAGE2_OUTPUT_FORMAT` | 文件格式：`png`、`jpeg`、`webp`；模板默认为 `png`，留空由服务决定 |
-| `GPT_IMAGE2_OUTPUT_COMPRESSION` | JPEG/WebP 压缩质量参数，范围 `0–100`；PNG 不使用，通常留空 |
-| `GPT_IMAGE2_MODERATION` | 审核档位：`auto` 或 `low`；留空使用服务默认 |
-| `GPT_IMAGE2_OUT_DIR` | 保存目录，默认 `./image2_output`，相对于运行时工作目录；可填 `F:/images/generated` 等绝对路径 |
-| `GPT_IMAGE2_TIMEOUT_MS` | 单位毫秒；`240000` 为 4 分钟。生成阶段（含排队与重试）共用一次额度；全部图片下载再共用一次额度，费用查询还可能额外等待最多约 8 秒 |
-| `GPT_IMAGE2_MAX_RETRIES` | 仅对可重试的 429 限流错误重试；默认 `2`，即首次请求后最多再试两次。余额不足、超时和 5xx 错误不会自动重试 |
-| `GPT_IMAGE2_MIN_INTERVAL_MS` | 本机相同服务和密钥的请求启动间隔，单位毫秒；`0` 不限制，`5000` 为 5 秒 |
-| `GPT_IMAGE2_SHOW_COST` | `false` 不显示生成摘要；`true` 显示模型、尺寸、质量、token 和可查到的实际费用 |
-| `GPT_IMAGE2_COST_LOOKUP_CLI` | 可选配套费用查询工具的路径，需有相应权限；留空时不自动寻找其他技能，没有可用工具时费用显示“暂未查到” |
+5. **按需配置 `extend.md`**：JSON 代码块的 `defaults` 管理模型、张数、比例、质量、格式等作图偏好。单次画图要求只覆盖当次参数，不修改配置文件。
 
 ## 怎么使用
 
 配置完成后，调用技能并输入画图要求。
+
+独立使用不需要安装 `content-gen`，也不需要任务参数表或执行快照。其他技能调用时的执行协议见 `SKILL.md`。
+
+用 `node scripts/gpt-image2.mjs --check-config` 检查本机配置，检查 Banana 时追加 `--model banana`。该检查不联网、不生图，只报告配置状态，不能证明余额或服务可达性。密钥只在 `.env` 或进程环境中设置，不通过命令行参数传入。
 
 **普通画图：**
 
@@ -95,3 +107,18 @@ $image-gen 用 sunburst 画一个绿色叶片图标，透明背景，PNG，方�
 ```text
 $image-gen 画一张山水插画，16:9，2K，保存到“F:\images\generated”。
 ```
+
+**使用 Banana：**
+
+```text
+$image-gen 用香蕉画 3 张植物插画，竖版 1:4，2K。
+```
+
+## 常见问题
+
+- **提示缺少密钥**：检查 `.env` 中所选模型对应分组是否已配置。两个分组不能互相替代，检查命令中的 `configured: false` 表示本机配置尚未就绪。
+- **修改默认值没有生效**：确认改的是 `extend.md` 的 JSON，而非仅修改表格；再按该文件的覆盖规则检查单次参数、环境变量和旧配置。
+- **参数不支持**：按 `extend.md` 核对模型与选项的组合。旧请求模式 `official-compatible` 已停用，模式设置见 `.env` 注释。
+- **超时或只成功部分图片**：保留成功图片及生成记录，核对平台使用记录后再决定是否重试，避免重复扣费。
+- **图片下载失败**：只允许从配置 API 的同源地址下载，不跟随跳转。跨域地址保存在恢复记录中，不会为了下载失败重新生图。
+- **查看图片信息**：在 `extend.md` 中开启 `show_info`，或单次使用 `--show-info`，生成后显示模型、实际分辨率、请求比例、已保存张数、质量、输出格式、背景设置、总耗时和输入/输出 token；临时关闭使用 `--no-info`。多图显示请求合计 token，未返回的数值标注“未提供”。
