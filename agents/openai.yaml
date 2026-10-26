@@ -1,4 +1,4 @@
 interface:
-  display_name: "图片创作服务 技能"
+  display_name: "图片创作服务 技能 (image-gen)"
   short_description: "根据文字和参考图生成图片，支持多种比例、清晰度与透明背景"
   default_prompt: "使用 $image-gen 根据我的描述或参考图生成图片，并直接展示生成结果。"
